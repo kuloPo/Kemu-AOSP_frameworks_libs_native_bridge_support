@@ -224,7 +224,6 @@ void DoCustomTrampolineWithThunk_vkGetDeviceProcAddr(HostCode callee, ProcessSta
 void DoCustomTrampolineWithThunk_vkGetInstanceProcAddr(HostCode callee, ProcessState* state);
 void RunGuest_vkEnumerateDeviceExtensionProperties(GuestAddr pc, GuestArgumentBuffer* buf);
 void RunGuest_vkEnumerateInstanceExtensionProperties(GuestAddr pc, GuestArgumentBuffer* buf);
-void RunGuest_vkCreateInstance(GuestAddr pc, GuestArgumentBuffer* buf);
 void RunGuest_vkGetDeviceProcAddr(GuestAddr pc, GuestArgumentBuffer* buf);
 void RunGuest_vkGetInstanceProcAddr(GuestAddr pc, GuestArgumentBuffer* buf);
 
@@ -3454,6 +3453,9 @@ const void* ConvertOptionalStructures(GuestType<const void*> head, std::unique_p
   for (auto ptr = StaticCast<GuestType<const VkBaseInStructure*>>(head); ToGuestAddr(ptr) != kNullGuestAddr; ptr = ToHostAddr<GuestType<VkBaseInStructure>>(ToGuestAddr(ptr))->pNext) {
     switch (VkStructureType(ToHostAddr<GuestType<const VkBaseInStructure>>(ToGuestAddr(ptr))->sType)) {
 %[2]s
+      case BERBERIS_VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO:
+      case BERBERIS_VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO:
+        return ConvertLoaderCreateInfoToHost(StaticCast<GuestType<const void*>>(ptr), holder, out_of_memory);
       default:
         continue;
     }
@@ -3482,6 +3484,9 @@ GuestType<const void*> ConvertOptionalStructures(const void* head, std::unique_p
   for (auto ptr = static_cast<const VkBaseInStructure*>(head); ptr != nullptr; ptr = ptr->pNext) {
     switch (ptr->sType) {
 %[4]s
+      case BERBERIS_VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO:
+      case BERBERIS_VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO:
+        return ConvertLoaderCreateInfoToGuest(ptr, holder, out_of_memory);
       default:
         continue;
     }
@@ -3568,12 +3573,16 @@ func printCustomTrampolies(w io.Writer, sorted_command_names []string, commands 
 		if command.Elem(cpp_types.FirstArch).Kind(cpp_types.FirstArch) != cpp_types.Void {
 			declare_ret = fmt.Sprintf("auto&& [ret] = GuestReturnReference<PFN_%s%s>(state);\n  ret = ", name, vfp)
 		}
+		conversion_error_check := ""
+		if returnsVkResult(command) {
+			conversion_error_check = fmt.Sprintf("if (out_of_memory) {\n%s    auto&& [ret] = GuestReturnReference<PFN_%s%s>(state);\n    ret = BERBERIS_VK_ERROR_OUT_OF_HOST_MEMORY;\n    return;\n  }\n  ", conversionErrorCleanup(command, true, "    "), name, vfp)
+		}
 		_, err = fmt.Fprintf(w, `void DoCustomTrampolineWithThunk_%[1]s(HostCode callee, ProcessState* state) {
   PFN_%[1]s callee_function = AsFuncPtr(callee);
   auto [%[3]s_guest] = GuestParamsValues<PFN_%[1]s%[2]s>(state);
-  [[maybe_unused]] bool out_of_memory;
+  [[maybe_unused]] bool out_of_memory = false;
   %[5]s;
-  %[6]scallee_function(%[4]s_host);
+  %[7]s%[6]scallee_function(%[4]s_host);
 }
 
 `,
@@ -3582,12 +3591,59 @@ func printCustomTrampolies(w io.Writer, sorted_command_names []string, commands 
 			strings.Join(param_names, "_guest, "),
 			strings.Join(param_names, "_host, "),
 			strings.Join(variable_declarations, ";\n  "),
-			declare_ret)
+			declare_ret,
+			conversion_error_check)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// No objects have been created when argument conversion fails. Clear output handle
+// arrays so callers can safely clean up multi-object creation/allocation failures.
+func conversionErrorCleanup(command cpp_types.Type, from_guest bool, indent string) string {
+	var cleanup strings.Builder
+	for i := uint(0); i < command.NumField(cpp_types.FirstArch); i++ {
+		field := command.Field(i, cpp_types.FirstArch)
+		field_type := field.Type()
+		if field_type.Kind(cpp_types.FirstArch) != cpp_types.Ptr {
+			continue
+		}
+		element := field_type.Elem(cpp_types.FirstArch)
+		if !vulkan_types.IsVulkanHandle(element) && !vulkan_types.IsVulkanNondispatchableHandle(element) {
+			continue
+		}
+		info := field.BaseFieldInfo().(vulkan_xml.ExtendedFieldInfo)
+		length := info.Length()
+		if length == nil {
+			continue
+		}
+		count := length.Name() + "_host"
+		if nested := info.NestedField(); nested != nil {
+			// The converted structure may be null after OOM. Read the count
+			// from the original input, whose lifetime spans the entire call.
+			if from_guest {
+				struct_type := length.Type().Elem(cpp_types.FirstArch)
+				if struct_type.Kind(cpp_types.FirstArch) == cpp_types.Const {
+					struct_type = struct_type.Elem(cpp_types.FirstArch)
+				}
+				count = fmt.Sprintf("ToHostAddr<GuestType<%s>>(ToGuestAddr(%s_guest))",
+					struct_type.Name(cpp_types.FirstArch), length.Name())
+			}
+			count += "->" + nested.Name()
+		} else if length.Type().Kind(cpp_types.FirstArch) == cpp_types.Ptr {
+			count = "*" + count
+		}
+		fmt.Fprintf(&cleanup, "%sif (%s_host != nullptr) {\n%s  std::fill_n(%s_host, %s, %s{});\n%s}\n",
+			indent, field.Name(), indent, field.Name(), count, element.Name(cpp_types.FirstArch), indent)
+	}
+	return cleanup.String()
+}
+
+// A command returning VkResult can report a failed argument conversion instead of being called.
+func returnsVkResult(command cpp_types.Type) bool {
+	return command.Elem(cpp_types.FirstArch).Name(cpp_types.FirstArch) == "VkResult"
 }
 
 func printCustomGuestRunners(w io.Writer, sorted_command_names []string, commands map[string]cpp_types.Type, host_arch, guest_arch cpp_types.Arch) (err error) {
@@ -3626,17 +3682,20 @@ func printCustomGuestRunners(w io.Writer, sorted_command_names []string, command
 				}
 			}
 		}
-		// vkCreateInstance needs additional non-trivial processing.
-		if params_are_compatible || name == "vkCreateInstance" {
+		if params_are_compatible {
 			continue
+		}
+		conversion_error_check := ""
+		if returnsVkResult(command) {
+			conversion_error_check = fmt.Sprintf("if (out_of_memory) {\n%s      auto&& [result] = HostResultReference<PFN_%s>(buf);\n      result = BERBERIS_VK_ERROR_OUT_OF_HOST_MEMORY;\n      return;\n    }\n    ", conversionErrorCleanup(command, false, "      "), name)
 		}
 		_, err = fmt.Fprintf(w, `void RunGuest_%[1]s(GuestAddr pc, GuestArgumentBuffer* buf) {
   auto [%[3]s_host] = HostArgumentsValues<PFN_%[1]s>(buf);
   {
-    [[maybe_unused]] bool out_of_memory;
+    [[maybe_unused]] bool out_of_memory = false;
     auto [%[2]s_guest] = GuestArgumentsReferences<PFN_%[1]s>(buf);
     %[4]s;
-    RunGuestCall(pc, buf);
+    %[5]sRunGuestCall(pc, buf);
   }
 }
 
@@ -3644,7 +3703,8 @@ func printCustomGuestRunners(w io.Writer, sorted_command_names []string, command
 			name,
 			strings.Join(param_names, "_guest, "),
 			strings.Join(param_names, "_host, "),
-			strings.Join(variable_declarations, ";\n    "))
+			strings.Join(variable_declarations, ";\n    "),
+			conversion_error_check)
 		if err != nil {
 			return err
 		}

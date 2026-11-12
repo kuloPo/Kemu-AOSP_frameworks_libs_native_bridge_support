@@ -103,3 +103,14 @@ filegroup {
         "proxy/emulated_api_checker.cc",
     ],
 }
+
+cc_test_host {
+    name: "native_bridge_vulkan_layer_create_info_tests",
+    defaults: ["native_bridge_support_defaults"],
+    srcs: ["proxy/vulkan_layer_create_info_test.cc"],
+    header_libs: [
+        "hwvulkan_headers",
+        "vulkan_headers",
+    ],
+    cpp_std: "c++20",
+}

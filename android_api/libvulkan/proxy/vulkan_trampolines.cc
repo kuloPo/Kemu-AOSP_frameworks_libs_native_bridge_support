@@ -34,9 +34,89 @@
 #include "berberis/runtime_primitives/runtime_library.h"
 
 #include "binary_search.h"
+#include "vulkan_layer_create_info.h"
 #include "vulkan_xml.h"
 
 namespace berberis {
+
+template <bool kToGuest, typename Function>
+Function ConvertLayerProcAddr(Function function, const char* name) {
+  if (!function) {
+    return nullptr;
+  }
+  if constexpr (kToGuest) {
+    const auto* conversion = FindElementByName(GetMapForvkGetProcAddr(), name);
+    CHECK(conversion);
+    WrapHostFunctionImpl(bit_cast<void*>(function), conversion->trampoline, name);
+    return function;
+  } else {
+    if (auto host_function = UnwrapHostFunction(ToGuestAddr(function))) {
+      return bit_cast<Function>(host_function);
+    }
+    const auto* conversion = FindElementByName(GetMapForRunGuestvkGetInstanceProcAddr(), name);
+    CHECK(conversion);
+    return bit_cast<Function>(conversion->wrapper(ToGuestAddr(function)));
+  }
+}
+
+template <bool kToGuest, typename Function>
+Function ConvertLayerCallback(Function function, const char* name) {
+  if constexpr (kToGuest) {
+    return bit_cast<Function>(ToGuestAddr(WrapHostFunctionIfNeeded(function, name)));
+  } else {
+    return WrapGuestFunctionIfNeeded(GuestType<Function>(function), name);
+  }
+}
+
+template <bool kToGuest, typename Base>
+const void* ConvertLoaderCreateInfo(const void* source,
+                                    std::unique_ptr<Base>& holder,
+                                    bool& out_of_memory) {
+  auto convert_chain = [](const void* next, std::unique_ptr<Base>& extensions, bool& oom) {
+    if constexpr (kToGuest) {
+      return ToHostAddr(ConvertOptionalStructures(next, extensions, oom));
+    } else {
+      return ConvertOptionalStructures(GuestType<const void*>(next), extensions, oom);
+    }
+  };
+  auto convert_proc = [](auto function, const char* name) {
+    return ConvertLayerProcAddr<kToGuest>(function, name);
+  };
+  auto convert_callback = [](auto function, const char* name) {
+    return ConvertLayerCallback<kToGuest>(function, name);
+  };
+  const auto* header = static_cast<const ::VkBaseInStructure*>(source);
+  if (header->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO) {
+    return ConvertVulkanLayerCreateInfo<::VkLayerInstanceCreateInfo, ::VkLayerInstanceLink>(
+        static_cast<const ::VkLayerInstanceCreateInfo*>(source),
+        holder,
+        out_of_memory,
+        convert_chain,
+        convert_proc,
+        convert_callback);
+  }
+  CHECK_EQ(header->sType, VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+  return ConvertVulkanLayerCreateInfo<::VkLayerDeviceCreateInfo, ::VkLayerDeviceLink>(
+      static_cast<const ::VkLayerDeviceCreateInfo*>(source),
+      holder,
+      out_of_memory,
+      convert_chain,
+      convert_proc,
+      convert_callback);
+}
+
+static const void* ConvertLoaderCreateInfoToHost(GuestType<const void*> source,
+                                                 std::unique_ptr<HostHolderBase>& holder,
+                                                 bool& out_of_memory) {
+  return ConvertLoaderCreateInfo<false>(ToHostAddr(source), holder, out_of_memory);
+}
+
+static GuestType<const void*> ConvertLoaderCreateInfoToGuest(
+    const void* source,
+    std::unique_ptr<GuestHolderBase>& holder,
+    bool& out_of_memory) {
+  return GuestType<const void*>(ConvertLoaderCreateInfo<true>(source, holder, out_of_memory));
+}
 
 namespace {
 
@@ -50,13 +130,21 @@ void DoCustomTrampolineWithThunk_vkAllocateCommandBuffers(HostCode callee, Proce
   PFN_vkAllocateCommandBuffers callee_function = AsFuncPtr(callee);
   auto [device_guest, pAllocateInfo_guest, pCommandBuffers_guest] =
       GuestParamsValues<PFN_vkAllocateCommandBuffers>(state);
-  [[maybe_unused]] bool out_of_memory;
+  bool out_of_memory = false;
   VkDevice device_host = device_guest;
   GuestType<const struct VkCommandBufferAllocateInfo*>::HostHolder pAllocateInfo_holder;
   const struct VkCommandBufferAllocateInfo* pAllocateInfo_host =
       ToHostType(pAllocateInfo_guest, pAllocateInfo_holder, out_of_memory);
   VkCommandBuffer* pCommandBuffers_host = pCommandBuffers_guest;
   auto&& [ret] = GuestReturnReference<PFN_vkAllocateCommandBuffers>(state);
+  if (out_of_memory) {
+    const auto count =
+        ToHostAddr<GuestType<VkCommandBufferAllocateInfo>>(ToGuestAddr(pAllocateInfo_guest))
+            ->commandBufferCount;
+    std::fill_n(pCommandBuffers_host, count, VkCommandBuffer{});
+    ret = VkResult::BERBERIS_VK_ERROR_OUT_OF_HOST_MEMORY;
+    return;
+  }
   ret = callee_function(device_host, pAllocateInfo_host, pCommandBuffers_host);
   if (ret >= VkResult::BERBERIS_VK_SUCCESS) {
     std::lock_guard lock(g_primary_command_buffer_mutex);
@@ -77,7 +165,7 @@ void DoCustomTrampolineWithThunk_vkAllocateCommandBuffers(HostCode callee, Proce
 void DoCustomTrampolineWithThunk_vkBeginCommandBuffer(HostCode callee, ProcessState* state) {
   PFN_vkBeginCommandBuffer callee_function = AsFuncPtr(callee);
   auto [commandBuffer_guest, pBeginInfo_guest] = GuestParamsValues<PFN_vkBeginCommandBuffer>(state);
-  bool out_of_memory;
+  bool out_of_memory = false;
   VkCommandBuffer commandBuffer_host = commandBuffer_guest;
   bool convert_inheritance_info = false;
   {
@@ -91,6 +179,10 @@ void DoCustomTrampolineWithThunk_vkBeginCommandBuffer(HostCode callee, ProcessSt
   const struct VkCommandBufferBeginInfo* pBeginInfo_host =
       ToHostType(pBeginInfo_guest, pBeginInfo_holder, convert_inheritance_info, out_of_memory);
   auto&& [ret] = GuestReturnReference<PFN_vkBeginCommandBuffer>(state);
+  if (out_of_memory) {
+    ret = VkResult::BERBERIS_VK_ERROR_OUT_OF_HOST_MEMORY;
+    return;
+  }
   ret = callee_function(commandBuffer_host, pBeginInfo_host);
 }
 
@@ -327,36 +419,6 @@ void RunGuest_vkEnumerateInstanceExtensionProperties(GuestAddr pc, GuestArgument
     FilterOutExtensionProperties(
         result, pPropertyCount_host, pProperties_host, properties_in_buf_size, properties_in_buf);
     return;
-  }
-}
-
-void RunGuest_vkCreateInstance(GuestAddr pc, GuestArgumentBuffer* buf) {
-  auto [pCreateInfo_host, pAllocator_host, pInstance_host] =
-      HostArgumentsValues<PFN_vkCreateInstance>(buf);
-  {
-    [[maybe_unused]] bool out_of_memory;
-    auto [pCreateInfo_guest, pAllocator_guest, pInstance_guest] =
-        GuestArgumentsReferences<PFN_vkCreateInstance>(buf);
-
-    const VkLayerInstanceCreateInfo* layer_create_info =
-        bit_cast<const VkLayerInstanceCreateInfo*>(pCreateInfo_host);
-
-    // Step through the pNext chain until we get to the link function
-    while (layer_create_info &&
-           (layer_create_info->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO ||
-            layer_create_info->function != VK_LAYER_FUNCTION_LINK)) {
-      layer_create_info = static_cast<const VkLayerInstanceCreateInfo*>(layer_create_info->pNext);
-    }
-    if (layer_create_info) {
-      void* func = bit_cast<void*>(layer_create_info->u.pLayerInfo->pfnNextGetInstanceProcAddr);
-      WrapHostFunctionImpl(
-          func, DoCustomTrampolineWithThunk_vkGetInstanceProcAddr, "NextGetInstanceProcAddr");
-    }
-
-    GuestType<const struct VkAllocationCallbacks*>::GuestHolder pAllocator_holder;
-    pAllocator_guest =
-        GuestType<const struct VkAllocationCallbacks*>(pAllocator_host, pAllocator_holder, out_of_memory);
-    RunGuestCall(pc, buf);
   }
 }
 

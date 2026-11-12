@@ -19,6 +19,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 
 #include "berberis/base/bit_util.h"
@@ -113,6 +114,10 @@ static GuestType<const void*> ConvertOptionalStructures(const void* head,
 static GuestType<void*> ConvertOptionalStructures(void* head,
                                                   std::unique_ptr<GuestHolderBase>& holder,
                                                   bool& out_of_memory);
+static const void* ConvertLoaderCreateInfoToHost(
+    GuestType<const void*> source, std::unique_ptr<HostHolderBase>& holder, bool& out_of_memory);
+static GuestType<const void*> ConvertLoaderCreateInfoToGuest(
+    const void* source, std::unique_ptr<GuestHolderBase>& holder, bool& out_of_memory);
 #endif  // BERBERIS_LAYOUT_CHECK_ONLY
 
 namespace {
